@@ -4,7 +4,7 @@
 
 Porting Meshtastic firmware to FreeWili 2 hardware (RP2350B Display CPU + WIO-E5 LoRa radio). Design spec at `docs/superpowers/specs/2026-04-05-meshtastic-freewili-design.md`, implementation plan at `docs/superpowers/plans/2026-04-05-meshtastic-freewili.md`.
 
-## Current Status: BLOCKED on display bring-up
+## Current Status: Display + Radio UART initialized — touch and buttons pending
 
 All code is written and compiles. The WIO-E5 bridge firmware builds. The Meshtastic firmware builds. But the ST7789 display doesn't render the Meshtastic UI.
 
@@ -20,27 +20,42 @@ All code is written and compiles. The WIO-E5 bridge firmware builds. The Meshtas
 
 5. **Debug probe** — multiprobe firmware at `multiprobe/sw/debugprobe/build/debugprobe_on_pico.uf2`. Interface 0=Display RP2350B, Interface 1=Main RP2350B, Interface 2=WIO-E5. Flash command: `openocd -s scripts -c "adapter driver cmsis-dap; cmsis-dap backend usb_bulk; cmsis-dap usb interface 0; transport select swd; adapter speed 1000" -f target/rp2350.cfg -c "init; reset halt; program firmware.bin 0x10000000 verify reset exit"`
 
-## The Core Problem
+## Root Cause (Found 2026-04-06)
 
-**SPI1 works in `initVariant()` but is permanently broken by the time `TFTDisplay::connect()` runs.** Even full `spi_deinit(spi1)` + `spi_init(spi1, 40MHz)` + `gpio_set_function(10/11, GPIO_FUNC_SPI)` in `lateInitVariant()` does NOT restore SPI1 functionality. Register dump showed SPI1 SSPCR0=0x65 (wrong format: FRF=TI_SS, SPO=1, DSS=6-bit) and SSPCR1 with SSE=0 (SPI disabled).
+**The firmware was panicking at `Wire.setSDA(26)` in main.cpp before any display code ran.**
 
-### What we tried and ruled out:
-- LovyanGFX: bypassed entirely with custom Pico SDK LGFX wrapper class — still doesn't work
-- `HW_SPI1_DEVICE`: removed, so Meshtastic's SPI init uses SPI0 (dummy pins 2/3/4/5) and doesn't touch SPI1
-- RP2350A vs RP2350B: tried `olimex_pico2bb48` (RP2350B) but `initVariant()` stopped being called entirely (no backlight, no pixel noise)
-- LORA_CS=-1 causing `pinMode(-1, OUTPUT)`: fixed to valid GPIO
-- Wrong IO expander type (PCAL6416A vs PCAL6524): confirmed PCAL6524 registers are correct (firmware code uses same addresses and works)
-- SPI host number (0 vs 1): confirmed SPI1 is correct for GPIO 8-11
-- Pin function conflicts: GPIO register dump shows correct FUNCSEL (10/11=SPI, 8/9=SIO)
-- GPIO pad control: output enabled, 4mA drive, normal settings
+`variant.h` defined `I2C_SDA 26` / `I2C_SCL 27`, which main.cpp fed to `Wire` (the default Arduino I2C object). On the rpipico2 board, `Wire` is hardcoded to `i2c0` via `__WIRE0_DEVICE`. But GPIO 26/27 are physically wired to `i2c1` — they are NOT valid pins for i2c0. The Arduino-Pico framework's `Wire.setSDA(26)` validates pin-to-peripheral mapping and calls `panic()` when the pin doesn't match.
 
-### What we haven't tried:
-- **Binary search** for what breaks SPI1: insert the green-fill test at progressively earlier points in main.cpp (between Wire.begin and screen->setup) to find the EXACT line that breaks SPI1
-- **Check if `SPI.begin(false)` on SPI0 with dummy pins 2/3/4 somehow resets SPI1** — on RP2350, spi_init() calls spi_reset() which might affect RESETS register for both SPI instances?
-- **Check the RP2350 RESETS register** (0x40020000) to see if SPI1 gets reset/unreset properly
-- **Use the original FreeWili st7789 driver** directly instead of LovyanGFX or our wrapper — port the `st7789.cpp` from `freewili-firmware/freewilimain/rmpLib/` into Meshtastic
-- **Disable ALL Meshtastic SPI init** (guard the SPI.begin block in main.cpp with `#ifndef FREEWILI`)
-- **Run display on Core 1** like the original FreeWili firmware does (Core 0=events, Core 1=display)
+This explains everything:
+- Display worked in `initVariant()` (runs before Wire setup)
+- Display was "broken" later — because the firmware halted at `Wire.setSDA(26)`
+- SPI1 reinit in `lateInitVariant()` "didn't work" — it never executed
+- Register dump showed garbage SPI1 values — SPI1 was never initialized (only IO expander was set up)
+
+### Fix Applied
+1. **variant.h**: Changed `I2C_SDA`/`I2C_SCL` → `I2C_SDA1`/`I2C_SCL1` so main.cpp routes through `Wire1` (i2c1), matching the hardware
+2. **main.cpp**: Guarded the LoRa SPI init block with `#if defined(FREEWILI)` skip — FreeWili uses UART radio, no SPI LoRa needed
+3. **variant.h**: Updated `TOUCH_I2C_PORT` from 0 to 1 (Wire1)
+4. Build compiles cleanly
+
+### Previous debugging (context)
+- LovyanGFX was bypassed with custom Pico SDK LGFX wrapper class (still in TFTDisplay.cpp)
+- `HW_SPI1_DEVICE` was removed so Meshtastic's SPI init wouldn't touch SPI1
+- LORA_CS was fixed from -1 to valid GPIO 5
+- IO expander confirmed as PCAL6524 at I2C 0x23
+
+### Display + radio confirmed working (2026-04-07)
+Meshtastic UI renders on ST7789 — no faults displayed. Shows "UNSENT" status, firmware version 2.7.21.
+
+### RP2350B board definition created
+Custom `freewili2` board (boards/freewili2.json) with `PICO_RP2350A=0` in variant pins_arduino.h at `.platformio/packages/framework-arduinopico/variants/freewili2/`. Enables GPIO 0-47.
+
+### UART radio: split-UART approach
+GPIO 32 = UART0_TX, GPIO 23 = UART1_RX — different hardware UARTs. Solution: Serial1 (UART0) for TX, Serial2 (UART1) for RX. Controlled by `USE_SPLIT_UART_RADIO` define. SerialPIO was attempted but hit PIO allocation conflicts.
+
+### Still disabled
+- **PIC16 buttons** — GPIO 38/39 are UART1 pins, but both hardware UARTs are used (Serial1 for radio TX, Serial2 for radio RX). Needs SerialPIO but PIO allocation conflicts with something. Investigate PIO usage in framework.
+- **Touch screen** — FT6336U at I2C 0x38 is detected by scanner, but custom LGFX class has `getTouch()` returning false. Need to integrate FT6336U touch input (either via Meshtastic's existing touch support or custom driver).
 
 ## Key Files
 
@@ -105,19 +120,10 @@ cd wio-e5-bridge && pio run -e wio-e5-bridge
 
 ## Recommended Next Steps
 
-1. **Find what breaks SPI1**: Add the proven blue-fill test code at successive points in main.cpp setup() to binary-search the exact line. The code that works in initVariant():
-```cpp
-#include "hardware/spi.h"
-#include "hardware/gpio.h"
-spi_init(spi1, 40000000);
-gpio_set_function(10, GPIO_FUNC_SPI);
-gpio_set_function(11, GPIO_FUNC_SPI);
-gpio_init(9); gpio_set_dir(9, GPIO_OUT); gpio_put(9, 1);
-gpio_init(8); gpio_set_dir(8, GPIO_OUT); gpio_put(8, 1);
-gpio_init(25); gpio_set_dir(25, GPIO_OUT); gpio_put(25, 1);
-// Then ST7789 init + blue fill (see variant.cpp history)
-```
+1. **Touch screen integration**: FT6336U at I2C 0x38 is on Wire (i2c1). Custom LGFX class needs `getTouch()` implemented, or wire into Meshtastic's `kbI2cAddress`/`INPUTDRIVER_ENCODER_TYPE` touch system. Check how other TFT variants (T-Deck, T-Watch) handle touch.
 
-2. **Or bypass the problem entirely**: Guard ALL SPI init in main.cpp with `#if !defined(FREEWILI)` and manage SPI1 exclusively via Pico SDK in the FREEWILI display code.
+2. **PIC buttons via SerialPIO**: Resolve PIO allocation conflict. Check what else uses PIO (Neopixel? I2S? Tone?). May need to disable conflicting PIO users or pre-allocate PIO programs. Alternatively, bit-bang the 9600 baud PIC UART in the polling loop (20ms period = plenty of time).
 
-3. **WIO-E5 programming**: Install STM32CubeProgrammer for RDP Level 1 unlock. OpenOCD/pyOCD cannot halt the CPU due to factory firmware protection.
+3. **WIO-E5 bridge firmware**: Install STM32CubeProgrammer for RDP Level 1 unlock, flash wio-e5-bridge firmware. Until then, radio UART is initialized but has no peer.
+
+4. **SCREEN_SEL mux**: The Main CPU RP2350B controls a display mux (SCREEN_SEL) via its IO expander at 0x22. May need the main CPU to release the display. Currently works because debug boot likely defaults mux correctly.
