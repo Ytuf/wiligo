@@ -1,0 +1,4 @@
+[submodule "meshtastic-firmware"]
+	path = meshtastic-firmware
+	url = https://github.com/Ytuf/firmware.git
+	branch = freewili-port

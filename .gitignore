@@ -1,0 +1,9 @@
+# Sibling-but-separate repos that aren't part of wiligo:
+multiprobe/
+
+# Per-project build/IDE artefacts (also gitignored inside each subdir, but
+# repeated here for clarity at the top level):
+**/.pio/
+**/build/
+**/.vscode/
+.claude/
