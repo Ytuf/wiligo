@@ -11,3 +11,4 @@ int radio_bridge_sleep(void);
 int radio_bridge_standby(void);
 int radio_bridge_check_rx(uint8_t *buf, uint16_t buf_size, float *rssi, float *snr);
 int radio_bridge_check_tx_done(void);
+void radio_bridge_diag_poll(void);

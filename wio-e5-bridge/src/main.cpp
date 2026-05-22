@@ -2,13 +2,18 @@
 #include "uart_protocol.h"
 #include "radio_bridge.h"
 
-// Forward declarations for parser functions
 extern "C" {
     int uart_proto_parse_byte(uint8_t byte, uint8_t *out_cmd, uint8_t *out_payload, uint16_t *out_len);
     void uart_proto_reset(void);
 }
 
 HardwareSerial BridgeSerial(PB7, PB6);
+
+volatile uint32_t g_radio_init_result __attribute__((used)) = 0xDEADBEEF;
+volatile uint32_t g_cmd_count         __attribute__((used)) = 0;
+volatile uint32_t g_loop_iters        __attribute__((used)) = 0;
+volatile uint8_t  g_last_cmd          __attribute__((used)) = 0;
+volatile uint8_t  g_last_status       __attribute__((used)) = 0;
 
 static uint8_t tx_buf[UART_RADIO_HEADER_SIZE + UART_RADIO_MAX_PAYLOAD + UART_RADIO_CRC_SIZE];
 
@@ -24,9 +29,12 @@ static void send_ack(uint8_t original_cmd, uint8_t status) {
 
 static void handle_command(uint8_t cmd, const uint8_t *payload, uint16_t len) {
     int result;
+    g_cmd_count++;
+    g_last_cmd = cmd;
     switch (cmd) {
     case CMD_RADIO_SET_DIO:
         result = radio_bridge_set_dio(payload, len);
+        g_last_status = (uint8_t)(result == 0 ? STATUS_OK : STATUS_ERR_UNKNOWN);
         send_ack(cmd, result == 0 ? STATUS_OK : STATUS_ERR_UNKNOWN);
         break;
     case CMD_RADIO_CONFIGURE:
@@ -58,21 +66,42 @@ static void handle_command(uint8_t cmd, const uint8_t *payload, uint16_t len) {
     }
 }
 
+// HardwareSerial::begin() and radio.begin() can leave PB6/PB7 in analog
+// mode; force PB6/PB7 → AF7 (USART1) explicitly.
+static void force_usart1_pinmux(void) {
+    uint32_t moder = GPIOB->MODER;
+    moder &= ~((0x3u << (6 * 2)) | (0x3u << (7 * 2)));
+    moder |=  ((0x2u << (6 * 2)) | (0x2u << (7 * 2)));
+    GPIOB->MODER = moder;
+
+    uint32_t afrl = GPIOB->AFR[0];
+    afrl &= ~((0xFu << (6 * 4)) | (0xFu << (7 * 4)));
+    afrl |=  ((0x7u << (6 * 4)) | (0x7u << (7 * 4)));
+    GPIOB->AFR[0] = afrl;
+}
+
 void setup() {
     BridgeSerial.begin(115200);
     uart_proto_reset();
+    force_usart1_pinmux();
 
-    int result = radio_bridge_init();
-    if (result != 0) {
-        pinMode(LED_BUILTIN, OUTPUT);
-        while (1) {
-            digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
-            delay(100);
-        }
-    }
+    // First radio.begin() is expected to fail — TCXO/DIO2 config arrives
+    // later via CMD_RADIO_SET_DIO. Capture the result, never block.
+    g_radio_init_result = (uint32_t)radio_bridge_init();
+
+    force_usart1_pinmux();
 }
 
 void loop() {
+    g_loop_iters++;
+
+    static uint32_t last_diag_ms = 0;
+    uint32_t now = millis();
+    if (now - last_diag_ms >= 50) {
+        last_diag_ms = now;
+        radio_bridge_diag_poll();
+    }
+
     while (BridgeSerial.available()) {
         uint8_t byte = BridgeSerial.read();
         uint8_t cmd;
