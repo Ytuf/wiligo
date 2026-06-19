@@ -36,7 +36,13 @@
 #include "uart_protocol.h"   // from ../wio-e5-bridge/src — frame builder + IDs
 
 #define SCOPE_TEST_ONLY    0
-#define BRIDGE_VERIFY_ONLY 1
+#define BRIDGE_VERIFY_ONLY 0
+// RECOVERY mode: when set to 1, the helper only inits the I/O expander to
+// the helper's normal UART-routing defaults, asks the PIC to pulse WIO_RST
+// (so the WIO gets a clean reset from any wedged state), then parks. No BOOT
+// pin manipulation, no UART probes, no bootloader sync. Use when the WIO has
+// fallen off the SWD bus and you want to recover before doing a clean unlock.
+#define RECOVERY_ONLY      1
 static_assert(!(SCOPE_TEST_ONLY && BRIDGE_VERIFY_ONLY),
               "Pick at most one mode");
 
@@ -45,7 +51,35 @@ static_assert(!(SCOPE_TEST_ONLY && BRIDGE_VERIFY_ONLY),
 #define I2C_SDA_PIN 26
 #define I2C_SCL_PIN 27
 #define IO_EXPANDER_ADDR 0x23
+// WIO_BOOT lives on the same PCAL6524 the helper already uses (0x23, the
+// Display IO expander on I2C1 sensor bus) at port 2 bit 1. The firmware
+// enum names that bit HOTPLUG_DET in fw2IOExpanderDisplay.h; on this board
+// rev it's actually wired to the WIO module's BOOT0 pin.
+#define BOOT_EXPANDER_ADDR IO_EXPANDER_ADDR
+#define BOOT_EXPANDER_P2_REG_OUT 0x06
+#define BOOT_EXPANDER_P2_REG_CFG 0x0E
+#define BOOT_EXPANDER_WIO_BOOT_MASK 0x02   // P2_1
+
+// Baseline port 2 values the existing init_io_expander() writes — we OR/AND
+// the WIO_BOOT bit into these so other bits (LED3, VREF selects, etc.) keep
+// the value the helper expects for normal operation.
+#define BOOT_EXPANDER_P2_OUT_BASE 0x85
+#define BOOT_EXPANDER_P2_CFG_BASE 0x02
 #define AT_BAUD 9600
+
+// Bit-bang UART to PIC16: TX = GPIO 38 (PIC RX), RX = GPIO 39 (PIC TX), 62500 baud.
+// Display CPU's hardware UARTs are uart0 (free here) / uart1 (taken by WIO above);
+// GPIO 38/39 aren't on a uart-function pin pair on RP2350B, so bit-bang is simplest.
+#define PIC_TX_PIN 38
+#define PIC_RX_PIN 39
+#define PIC_BIT_US 16    // 1/62500 = 16 µs/bit
+
+#define PIC_CMD_HDR1 0xD0
+#define PIC_CMD_HDR2 0xD5
+#define PIC_CMD_WIO_PULSE 0x01
+#define PIC_ACK_HDR1 0xD0
+#define PIC_ACK_HDR2 0xD5
+#define PIC_ACK_DONE 0x81
 
 #define STATUS_PENDING        0u
 #define STATUS_OK_RECEIVED    1u
@@ -94,6 +128,31 @@ volatile uint8_t  g_bridge_resp[32]   __attribute__((used)) = {0}; // bytes of l
 
 volatile uint32_t g_ioexp_diag[9] __attribute__((used)) = {0};
 
+// PIC pulse path diagnostics — readable over SWD to debug the new turnkey flow.
+#define PIC_PULSE_PENDING       0u
+#define PIC_PULSE_BOOT_I2C_FAIL 1u   // setting WIO_BOOT high on expander 0x21 failed
+#define PIC_PULSE_NO_ACK        2u   // PIC didn't ACK within timeout
+#define PIC_PULSE_OK            3u
+volatile uint32_t g_pic_pulse_status __attribute__((used)) = PIC_PULSE_PENDING;
+volatile int32_t  g_pic_boot_rc1     __attribute__((used)) = 0;  // i2c_write rc for OUT reg
+volatile int32_t  g_pic_boot_rc2     __attribute__((used)) = 0;  // i2c_write rc for CFG reg
+volatile uint32_t g_pic_ack_byte_count __attribute__((used)) = 0;
+volatile uint8_t  g_pic_ack_bytes[4]   __attribute__((used)) = {0};
+
+// I2C bus scan results — 128 bits, one per 7-bit address. Bit set = ACK.
+volatile uint32_t g_i2c_scan[4] __attribute__((used)) = {0, 0, 0, 0};
+
+// Post-PIC-pulse diagnostic probes — exercise BOTH polarities to narrow down
+// whether 0x23 P2_1 is WIO_BOOT and which direction enters the bootloader.
+volatile uint32_t g_probe_at_lo_rxlen  __attribute__((used)) = 0;  // AT @ 9600  after BOOT=lo
+volatile uint8_t  g_probe_at_lo_buf[16] __attribute__((used)) = {0};
+volatile uint32_t g_probe_at_hi_rxlen  __attribute__((used)) = 0;  // AT @ 9600  after BOOT=hi
+volatile uint8_t  g_probe_at_hi_buf[16] __attribute__((used)) = {0};
+volatile uint32_t g_probe_bl_lo_rxlen  __attribute__((used)) = 0;  // 0x7F @ 115200 8-E-1 BOOT=lo
+volatile uint8_t  g_probe_bl_lo_buf[16] __attribute__((used)) = {0};
+volatile uint32_t g_probe_bl_hi_rxlen  __attribute__((used)) = 0;  // 0x7F @ 115200 8-E-1 BOOT=hi
+volatile uint8_t  g_probe_bl_hi_buf[16] __attribute__((used)) = {0};
+
 #define GPIO23_SAMPLE_COUNT 8000
 volatile uint8_t  g_gpio23_samples[GPIO23_SAMPLE_COUNT] __attribute__((used)) = {0};
 volatile uint32_t g_gpio23_sample_done __attribute__((used)) = 0;
@@ -108,6 +167,98 @@ volatile uint32_t g_rx_log_count __attribute__((used)) = 0;
 volatile uint32_t g_rx_iters_with_bytes __attribute__((used)) = 0;
 
 static rpSerialComm obLoRAComm;
+
+// ---- PIC link: bit-bang 8-N-1 @ 62500 baud on GPIO 38 (TX) / 39 (RX) ----
+
+static void pic_uart_init(void) {
+    gpio_init(PIC_TX_PIN);
+    gpio_set_dir(PIC_TX_PIN, GPIO_OUT);
+    gpio_put(PIC_TX_PIN, 1);             // idle high
+    gpio_init(PIC_RX_PIN);
+    gpio_set_dir(PIC_RX_PIN, GPIO_IN);
+    gpio_pull_up(PIC_RX_PIN);
+}
+
+static void pic_tx_byte(uint8_t b) {
+    gpio_put(PIC_TX_PIN, 0);             // start bit
+    busy_wait_us(PIC_BIT_US);
+    for (int i = 0; i < 8; i++) {
+        gpio_put(PIC_TX_PIN, (b >> i) & 1);
+        busy_wait_us(PIC_BIT_US);
+    }
+    gpio_put(PIC_TX_PIN, 1);             // stop bit
+    busy_wait_us(PIC_BIT_US);
+}
+
+static int pic_rx_byte(uint32_t timeout_us) {
+    absolute_time_t deadline = make_timeout_time_us(timeout_us);
+    while (!time_reached(deadline)) {
+        if (!gpio_get(PIC_RX_PIN)) {
+            // Align to middle of bit 0: half bit time past the start edge,
+            // then full bit times between samples.
+            busy_wait_us(PIC_BIT_US + PIC_BIT_US / 2);
+            uint8_t v = 0;
+            for (int i = 0; i < 8; i++) {
+                if (gpio_get(PIC_RX_PIN)) v |= (1u << i);
+                busy_wait_us(PIC_BIT_US);
+            }
+            return v;
+        }
+    }
+    return -1;
+}
+
+// Drive WIO_BOOT (0x23 P2_1) high/low. Read-modify-write semantics on top of
+// the baseline port-2 values init_io_expander() leaves, so siblings keep their
+// values. rc's surfaced via globals so SWD can find an i2c NACK.
+static bool set_wio_boot(bool high) {
+    uint8_t out_val = high
+        ? (uint8_t)(BOOT_EXPANDER_P2_OUT_BASE |  BOOT_EXPANDER_WIO_BOOT_MASK)
+        : (uint8_t)(BOOT_EXPANDER_P2_OUT_BASE & ~BOOT_EXPANDER_WIO_BOOT_MASK);
+    uint8_t out_cmd[] = {BOOT_EXPANDER_P2_REG_OUT, out_val};
+    int rc1 = i2c_write_blocking(i2c1, BOOT_EXPANDER_ADDR, out_cmd, sizeof(out_cmd), false);
+    g_pic_boot_rc1 = rc1;
+    // Clear P2_1 in the config register so the bit is driven as an output
+    // (PCAL6524 config: 0 = output, 1 = input).
+    uint8_t cfg_val = (uint8_t)(BOOT_EXPANDER_P2_CFG_BASE & ~BOOT_EXPANDER_WIO_BOOT_MASK);
+    uint8_t cfg_cmd[] = {BOOT_EXPANDER_P2_REG_CFG, cfg_val};
+    int rc2 = i2c_write_blocking(i2c1, BOOT_EXPANDER_ADDR, cfg_cmd, sizeof(cfg_cmd), false);
+    g_pic_boot_rc2 = rc2;
+    return rc1 == 2 && rc2 == 2;
+}
+
+// Ask the PIC to pulse WIO_RST. Caller is expected to have already set BOOT.
+// Returns true iff the PIC ACK'd within 1 s (50 ms hold + 200 ms post-reset +
+// budget for bit-bang round-trip).
+static bool pic_pulse_wio(void) {
+    pic_tx_byte(PIC_CMD_HDR1);
+    busy_wait_us(5000);   // 5 ms inter-byte — fits inside the PIC's 1 ms RX poll
+    pic_tx_byte(PIC_CMD_HDR2);
+    busy_wait_us(5000);
+    pic_tx_byte(PIC_CMD_WIO_PULSE);
+
+    // Wait for the 3-byte ACK. PIC's pollBtns also TX's button reports
+    // (header 0xC0 0xC5) every ~1.6 s, so filter on the 0xD0 0xD5 prefix.
+    uint8_t state = 0;
+    absolute_time_t deadline = make_timeout_time_ms(1000);
+    g_pic_ack_byte_count = 0;
+    while (!time_reached(deadline)) {
+        int b = pic_rx_byte(50 * 1000);
+        if (b < 0) continue;
+        if (g_pic_ack_byte_count < sizeof(g_pic_ack_bytes)) {
+            g_pic_ack_bytes[g_pic_ack_byte_count] = (uint8_t)b;
+        }
+        g_pic_ack_byte_count++;
+        switch (state) {
+            case 0: state = (b == PIC_ACK_HDR1) ? 1 : 0; break;
+            case 1: state = (b == PIC_ACK_HDR2) ? 2 : 0; break;
+            case 2:
+                return (b == PIC_ACK_DONE);
+            default: state = 0; break;
+        }
+    }
+    return false;
+}
 
 static void init_io_expander(void) {
     i2c_init(i2c1, 400000);
@@ -216,6 +367,15 @@ int main(void) {
     sleep_ms(200);
     wio_drain();
 
+#if RECOVERY_ONLY
+    g_boot_mark = 0xC0FFEE70;
+    pic_uart_init();
+    sleep_ms(50);
+    pic_pulse_wio();   // best-effort, status not checked — recovery is fire-and-forget
+    g_boot_mark = 0xC0FFEE71;
+    while (1) sleep_ms(1000);
+#endif
+
 #if SCOPE_TEST_ONLY
     // Scope verification mode: spam AT continuously and capture the AT
     // firmware's reply into globals for SWD inspection / breakpointing.
@@ -301,69 +461,98 @@ int main(void) {
     char resp[512];
     size_t resp_len;
 
-    // Loop AT every 2 seconds so a HOME+CANCEL WIO reset during this window
-    // catches a fresh, awake WIO before it returns to STANDBY.
-    for (int iter = 0; iter < 30; iter++) {
-        g_boot_mark = 0xC0FFEE10 + iter;
-        sleep_ms(50);
-        wio_drain();
-        wio_write("AT\r\n");
-        resp_len = wio_read_until(resp, sizeof(resp), 1500);
+    // Turnkey unlock path: drive WIO_BOOT high via expander 0x21, ask PIC to
+    // pulse WIO_RST, and the WIO comes out of reset directly into the AN5482
+    // UART system bootloader at 115200 8-E-1 — no AT firmware involvement.
+    g_boot_mark = 0xC0FFEE20;
+    pic_uart_init();
 
-        // Accumulate across all iterations
-        if (resp_len > 0) {
-            g_rx_iters_with_bytes++;
-            for (size_t i = 0; i < resp_len && g_rx_log_count < RX_LOG_MAX; i++) {
-                g_rx_log[g_rx_log_count] = (uint8_t)resp[i];
-                g_rx_log_iter[g_rx_log_count] = (uint16_t)iter;
-                g_rx_log_count++;
+    // Scan all 7-bit addresses on i2c1 so SWD can see which expanders ACK.
+    // 0-byte write is a no-op in the SDK — use a 1-byte read instead: the
+    // address phase happens for real, and a NACK shows up as a negative rc.
+    for (uint8_t a = 0; a < 128; a++) {
+        uint8_t dummy = 0;
+        int rc = i2c_read_blocking(i2c1, a, &dummy, 1, false);
+        if (rc == 1) g_i2c_scan[a >> 5] |= (1u << (a & 31));
+    }
+
+    if (!set_wio_boot(true)) {
+        g_pic_pulse_status = PIC_PULSE_BOOT_I2C_FAIL;
+        goto park;
+    }
+    sleep_ms(10);
+
+    if (!pic_pulse_wio()) {
+        g_pic_pulse_status = PIC_PULSE_NO_ACK;
+    } else {
+        g_pic_pulse_status = PIC_PULSE_OK;
+    }
+
+    // Diagnostic 4-way probe — pulse WIO with BOOT=hi and BOOT=lo, and at each
+    // pulse try AT @ 9600 and bootloader sync @ 115200 8-E-1. Whichever probe
+    // gets bytes back tells us the correct BOOT polarity for this board rev.
+    {
+        auto probe_after_pulse = [&](bool boot_high,
+                                      volatile uint32_t *at_len, volatile uint8_t *at_buf,
+                                      volatile uint32_t *bl_len, volatile uint8_t *bl_buf) {
+            char rxbuf[16];
+            size_t rxlen;
+            set_wio_boot(boot_high);
+            sleep_ms(10);
+            pic_pulse_wio();   // best-effort, status not re-stored
+            sleep_ms(50);
+
+            // AT @ 9600 8-N-1
+            uart_set_baudrate(uart1, 9600);
+            uart_set_format(uart1, 8, 1, UART_PARITY_NONE);
+            wio_drain();
+            wio_write("AT\r\n");
+            rxlen = wio_read_until(rxbuf, sizeof(rxbuf), 500);
+            *at_len = (uint32_t)rxlen;
+            for (size_t i = 0; i < sizeof(rxbuf); i++) at_buf[i] = (i < rxlen) ? (uint8_t)rxbuf[i] : 0;
+
+            // 0x7F @ 115200 8-E-1 — send REPEATEDLY (per AN5482, "send until ACK")
+            // and capture up to 16 bytes across a 1 s window.
+            sleep_ms(50);
+            uart_set_baudrate(uart1, 115200);
+            uart_set_format(uart1, 8, 1, UART_PARITY_EVEN);
+            wio_drain();
+            size_t collected = 0;
+            absolute_time_t deadline = make_timeout_time_ms(1000);
+            absolute_time_t next_tx = get_absolute_time();
+            while (!time_reached(deadline) && collected < 16) {
+                if (time_reached(next_tx)) {
+                    unsigned char sync = 0x7F;
+                    obLoRAComm.txData(&sync, 1);
+                    next_tx = make_timeout_time_ms(50);   // ~20 syncs/sec
+                }
+                int avail = obLoRAComm.rxDataCount();
+                if (avail > 0) {
+                    int want = (int)(16 - collected);
+                    if (want > avail) want = avail;
+                    int got = obLoRAComm.rxReadData((unsigned char *)(rxbuf + collected), want);
+                    if (got > 0) collected += (size_t)got;
+                }
             }
-        }
+            *bl_len = (uint32_t)collected;
+            for (size_t i = 0; i < 16; i++) bl_buf[i] = (i < collected) ? (uint8_t)rxbuf[i] : 0;
+        };
 
-        if (resp_len > 0 && strstr(resp, "OK") != NULL) {
-            write_at_result(STATUS_OK_RECEIVED, resp, resp_len);
-            break;
-        }
-        if (resp_len > 0) {
-            write_at_result(STATUS_BYTES_NO_OK, resp, resp_len);
-        }
-        sleep_ms(500);
+        probe_after_pulse(false, &g_probe_at_lo_rxlen, g_probe_at_lo_buf,
+                                 &g_probe_bl_lo_rxlen, g_probe_bl_lo_buf);
+        probe_after_pulse(true,  &g_probe_at_hi_rxlen, g_probe_at_hi_buf,
+                                 &g_probe_bl_hi_rxlen, g_probe_bl_hi_buf);
     }
 
-    // If AT firmware acknowledged, request DFU per Seeed spec §4.22.
-    // "For UART bootloader, AT+DFU=ON will make device enter bootloader
-    //  mode automatically." → no repower needed on this hardware.
-    if (g_at_result.status == STATUS_OK_RECEIVED) {
-        g_boot_mark = 0xC0FFEE30;
-        sleep_ms(50);
-        wio_drain();
-        wio_write("AT+DFU=ON\r\n");
-        resp_len = wio_read_until(resp, sizeof(resp), 2000);
-
-        // Capture into the dedicated DFU buffer (don't clobber g_at_result)
-        g_dfu_result.resp_len = resp_len;
-        size_t cap = resp_len < sizeof(g_dfu_result.response) - 1
-                   ? resp_len : sizeof(g_dfu_result.response) - 1;
-        for (size_t i = 0; i < cap; i++) {
-            g_dfu_result.response[i] = resp[i];
-        }
-        g_dfu_result.response[cap] = 0;
-        g_dfu_result.status = STATUS_DFU_RESPONSE;
-        g_dfu_result.magic = 0xDEADBEEF;
-
-        sleep_ms(200);
-    }
-
-    // After AT+DFU=ON, the AT firmware resets and the chip enters DFU mode.
-    // Scope observation: the bootloader transmits at 115200 baud (not 9600
-    // like the AT firmware) with 8-E-1 framing per AN5482. Switch BOTH baud
-    // and parity before sending the sync byte.
-    sleep_ms(200);          // let the chip finish resetting into bootloader
+    g_boot_mark = 0xC0FFEE21;
+    sleep_ms(50);
     wio_drain();
     uart_set_baudrate(uart1, 115200);
     uart_set_format(uart1, 8, 1, UART_PARITY_EVEN);
 
-    // Bootloader sync: send 0x7F, expect 0x79 ACK.
+    // Bootloader sync: send 0x7F, expect 0x79 ACK. Wrapped in a block scope
+    // so the earlier goto-park paths don't jump over `sync` / `unprot` inits.
+    {
     g_boot_mark = 0xC0FFEE40;
     unsigned char sync = 0x7F;
     obLoRAComm.txData(&sync, 1);
@@ -422,8 +611,14 @@ int main(void) {
             g_unlock_status = UNLOCK_ERASE_TIMEOUT;
         }
     }
+    }   // close the bootloader-sync scope
 
 park:
+    // Release WIO_BOOT so the next reset boots into the (now-flashable) user
+    // flash, not back into the bootloader. Best-effort — if i2c fails here the
+    // bridge SWD flash that follows will still write to address 0x08000000,
+    // and the bridge code will run as long as BOOT is low at that next reset.
+    (void)set_wio_boot(false);
     g_boot_mark = 0xC0FFEE60;
     while (1) {
         sleep_ms(1000);
