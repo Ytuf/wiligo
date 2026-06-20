@@ -19,7 +19,7 @@ Chains the three steps for a FreeWili 2 from blank to running mesh:
   `cmsis-dap usb interface N`.
 - **Release artifacts** in `tools/artifacts/` — fetch with:
   ```powershell
-  gh release download v0.2.0 --repo Ytuf/wiligo --dir tools/artifacts --pattern '*.elf'
+  gh release download v0.2.2 --repo Ytuf/wiligo --dir tools/artifacts --pattern '*.elf'
   ```
 
 ### Usage

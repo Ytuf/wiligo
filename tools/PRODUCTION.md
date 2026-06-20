@@ -2,7 +2,7 @@
 
 Operator runbook for the production flash bench. Walk this top-to-bottom on a
 fresh host. Every command is copy/paste; no judgment calls until section 4
-(exit code matrix). Assumes `v0.2.1` artifacts; bump the tag where noted when
+(exit code matrix). Assumes `v0.2.2` artifacts; bump the tag where noted when
 a newer release ships.
 
 ---
@@ -63,7 +63,7 @@ gh auth login                        # one-time browser auth
 ### 2d. Download release artifacts
 
 ```powershell
-gh release download v0.2.1 --repo Ytuf/wiligo --dir tools/artifacts --pattern '*.elf'
+gh release download v0.2.2 --repo Ytuf/wiligo --dir tools/artifacts --pattern '*.elf'
 ```
 
 Expected files in `tools/artifacts/` after this:
@@ -255,7 +255,7 @@ internal test units that need to interop on the shared-key dev mesh.
 ### How to switch
 
 ```powershell
-gh release download v0.2.1 --repo Ytuf/wiligo --dir tools/artifacts --clobber --pattern 'meshtastic-freewili-production.elf'
+gh release download v0.2.2 --repo Ytuf/wiligo --dir tools/artifacts --clobber --pattern 'meshtastic-freewili-production.elf'
 ```
 
 Then rename or symlink so `flash-board.ps1` picks it up:
@@ -277,7 +277,100 @@ in its boot log. If both print the same key, you flashed the dev build.
 
 ---
 
-## 9. Recovery procedures
+## 9. ESP32-C5 cross-verification (optional, recommended for QC)
+
+`flash-board.ps1`'s sanity check (`g_uart_byte_count > 0`) proves the
+Display CPU is consuming bytes from the WIO bridge. That's necessary but
+not sufficient — it doesn't verify the radio command/response protocol
+actually round-trips, only that *some* traffic flows.
+
+For an independent, **command-level cross-check** that exercises the
+bridge from the *other* side of the board, flash the `LoraTest` ESP32-C5
+firmware. It sends `CMD_RADIO_GET_STATUS` frames at 115200 over LPUART1
+and color-codes the answer on the on-board WS2812:
+
+| LED | Result | Meaning |
+|---|---|---|
+| 🟢 green steady | `PASS` | Bridge framed-protocol round-trip works |
+| 🟠 orange steady | `AT_DETECTED` | WIO still on factory Seeed AT firmware (board not yet through `flash-board.ps1`) |
+| 🟣 magenta | `CRC_FAIL` | Got a frame back but CRC poly mismatch |
+| 🟡 yellow | `PARTIAL_FRAME` | Saw sync but no full frame; routing wonky |
+| 🔴 red fast-blink | `NO_COMMS` | LPUART1 not receiving from ESP — bridge old build, or board damaged |
+
+### Why this is worth the extra step
+
+The Display CPU path uses **USART1 on PB6/PB7** (selected through the
+PCAL6524 demux). The ESP path uses **LPUART1 on PC0/PC1** — a completely
+separate UART peripheral, no mux involved. Catching the bridge firmware
+on the wrong code path or the WIO chip with a bad LPUART1 fuse is what
+this test does. Two independent verification paths = much higher
+confidence the unit is shippable.
+
+### Hardware needed
+
+- A FreeWili 2 already brought up via `flash-board.ps1` (steps 1-3 done).
+- Type-C USB cable (the board has multiple, the ESP debug port is on the
+  shared hub at PORT 5 — any USB cable into the board's USB-C reaches it).
+
+### One-shot flash + verify
+
+```powershell
+# 1. Put the ESP32-C5 in download mode (it does NOT enumerate automatically).
+#    On the FreeWili 2: hold BOOT, tap RESET, release BOOT.
+#    An Espressif VID_303A serial port appears on Windows / /dev/ttyACM* on Linux.
+
+# 2. Flash:
+esptool --chip esp32c5 --port <COM-of-VID_303A> --baud 460800 `
+        --before default-reset --after hard-reset write-flash `
+        --flash-mode dio --flash-freq 80m --flash-size 2MB `
+        0x2000  tools/artifacts/loratest-esp32c5-bootloader.bin `
+        0x8000  tools/artifacts/loratest-esp32c5-ptable.bin `
+        0x10000 tools/artifacts/loratest-esp32c5.bin
+
+# 3. Watch the WS2812 on the board:
+#    - 🟢 green within ~3 s -> PASS, ship the board.
+#    - 🟠 orange -> board hasn't been through flash-board.ps1 yet.
+#    - 🔴 red blinking -> bridge UART path broken; do not ship.
+```
+
+The ESP firmware **re-polls every ~5 s**, so if a board is being moved
+between fixtures the indicator will reflect the current state, not a
+stale boot snapshot.
+
+### Read the counters for an audit log
+
+If you want a numeric record per board instead of an LED snapshot,
+attach to the C5's USB-Serial/JTAG (same VID_303A port at 115200 8N1)
+after flash and grab one line:
+
+```
+I (12345) wio_test: polls=N pass=N at=N nocomms=N crc=N partial=N
+```
+
+`pass == polls` after a few cycles = board passes. Anything else = fail.
+
+### What can fail and what to do
+
+| Outcome | Action |
+|---|---|
+| 🟢 green | Board passes both Display-CPU and ESP cross-checks. Box and ship. |
+| 🟠 orange | Run `flash-board.ps1` first, then re-flash + re-run LoraTest. |
+| 🟣 magenta | The bridge firmware on the WIO is from a different version than the ESP test was built against. Re-flash both with the same release. |
+| 🟡 yellow | Most likely a bad solder joint on PC0/PC1. Visually inspect; if questionable, scrap the unit. |
+| 🔴 red | Either the bridge was never flashed (run `flash-board.ps1`), or the bridge build doesn't have LPUART1 support (built before v0.2.2). Re-flash with the v0.2.2+ bridge ELF. |
+
+### Source
+
+`LoraTest` lives outside the wiligo repo (it's a standalone ESP-IDF
+project). Source at `..` of the wiligo repo on the dev host; binaries
+ship in the v0.2.2 GitHub release as `loratest-esp32c5.{bin,elf}` +
+`loratest-esp32c5-bootloader.bin` + `loratest-esp32c5-ptable.bin`. If
+you want to rebuild: `idf.py set-target esp32c5 && idf.py build` from
+the `LoraTest/LoraTest/` directory.
+
+---
+
+## 10. Recovery procedures
 
 ### WIO-E5 falls off the SWD bus
 
@@ -328,7 +421,7 @@ re-attempts, AND the D2 power LED is dark or flickering.
 
 ---
 
-## 10. Known limitations (v0.2.1)
+## 11. Known limitations (v0.2.2)
 
 Carry this list into every customer demo. These are tracked against
 later releases; they are not flash-station issues.
@@ -349,5 +442,5 @@ later releases; they are not flash-station issues.
   reboot.
 
 Audit status: 27 confirmed bugs from the v0.2.0 audit, ~13 fixed in
-v0.2.1. The rest are blocked on the SD / RTC APIs and ride as known
+v0.2.2. The rest are blocked on the SD / RTC APIs and ride as known
 issues against v0.3.x.

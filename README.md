@@ -30,7 +30,7 @@ git submodule update --init --recursive
 One-shot from release artifacts:
 
 ```powershell
-gh release download v0.2.0 --repo Ytuf/wiligo --dir tools/artifacts --pattern '*.elf'
+gh release download v0.2.2 --repo Ytuf/wiligo --dir tools/artifacts --pattern '*.elf'
 pwsh tools/flash-board.ps1
 ```
 
@@ -39,7 +39,7 @@ on-board RP2040 multiprobe (CMSIS-DAP). See `tools/README.md` for flags
 (`-ForceUnlock`, `-UseLocalBuilds`, `-SkipMeshtastic`) and each subdirectory
 README for per-project build instructions.
 
-## What works in v0.2.0
+## What works in v0.2.2
 
 - **LoRa bridge** via WIO-E5. Defaults to US LongFast slot 19 (906.875 MHz).
   You can pick a different slot in the UI but it only persists for one boot
@@ -67,7 +67,7 @@ README for per-project build instructions.
 The Meshtastic firmware on the Display RP2350B has a persistence stub at
 `meshtastic-firmware/src/mesh/NodeDB.cpp:1439` — `saveProto()` returns `true`
 without writing (RP2350 SMP + arduino-pico LittleFS hang on flash write).
-Every boot starts from defaults. Workarounds shipped in v0.2.0:
+Every boot starts from defaults. Workarounds shipped in v0.2.2:
 
 - **Build-time hardcoded PKI keypair** (`FW2_FIXED_PRIVKEY` in `NodeDB.cpp`)
   so reboots don't churn the pubkey — peers (especially LilyGo T-Deck class
@@ -91,6 +91,6 @@ rotating the constant in `NodeDB.cpp`.
 
 ## Audit status
 
-Full firmware audit completed for v0.2.0: 27 confirmed bugs, ~13 fixed in
+Full firmware audit completed for v0.2.2: 27 confirmed bugs, ~13 fixed in
 this release. The remainder are blocked on the SD and RTC UART APIs and
 ship as known issues against v0.3.x.

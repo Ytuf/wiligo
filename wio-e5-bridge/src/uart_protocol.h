@@ -56,6 +56,26 @@
 #define DIO_TCXO_OFFSET       1  // uint8_t, TCXO voltage * 10 (e.g., 18 = 1.8V)
 #define DIO_PAYLOAD_SIZE      2
 
+// Parser state — one instance per UART so a half-frame on one serial
+// is not clobbered by a complete frame on the other.
+typedef enum {
+    RX_WAIT_SYNC1,
+    RX_WAIT_SYNC2,
+    RX_WAIT_CMD,
+    RX_WAIT_LEN_HI,
+    RX_WAIT_LEN_LO,
+    RX_WAIT_PAYLOAD,
+    RX_WAIT_CRC
+} rx_state_t;
+
+typedef struct {
+    rx_state_t state;
+    uint8_t cmd;
+    uint16_t payload_len;
+    uint16_t payload_idx;
+    uint8_t payload[UART_RADIO_MAX_PAYLOAD];
+} uart_proto_ctx_t;
+
 // CRC8 (CCITT polynomial 0x07)
 static inline uint8_t crc8(const uint8_t *data, uint16_t len) {
     uint8_t crc = 0x00;
